@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timezone
+from datetime import timedelta, timezone
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
@@ -37,11 +37,13 @@ from app.userbot.client_factory import create_telegram_client
 
 router = Router(name="admin_panel")
 
+UZ_TZ = timezone(timedelta(hours=5))
+
 
 def _fmt_dt(dt) -> str:
     if not dt:
         return "—"
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return dt.astimezone(UZ_TZ).strftime("%Y-%m-%d %H:%M (UZT)")
 
 
 # ============================================================================
