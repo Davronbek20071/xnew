@@ -38,5 +38,10 @@ def create_bot_and_dispatcher(
     dp.message.middleware(admin_mw)
     dp.callback_query.middleware(admin_mw)
 
+    # Vercel warm-containerda qayta chaqirilganda "Router is already attached"
+    # xatosi chiqmasligi uchun avvalgi bog'lanishni uzamiz.
+    if getattr(admin_router, "_parent_router", None) is not None:
+        admin_router._parent_router = None
+
     dp.include_router(admin_router)
     return bot, dp
