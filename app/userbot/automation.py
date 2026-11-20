@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from loguru import logger
 from telethon import TelegramClient
@@ -16,7 +16,6 @@ from telethon.errors import (
     UserDeactivatedBanError,
     UserDeactivatedError,
 )
-from telethon.tl.types import Message
 
 from app.db.models import AccountModel, AccountStatus, DynamicSettings
 from app.db.repository import SupabaseRepository
@@ -29,10 +28,12 @@ from app.userbot.parsers import (
 )
 from app.userbot.tasks.base import BaseTaskHandler
 from app.userbot.tasks.subscribe import (
+    EARN_MENU_KEYWORDS,
     SubscribeTaskHandler,
     extract_button_texts,
     extract_inline_urls,
     find_inline_callback_coords,
+    find_recent_reply_button,
     find_reply_button_text,
     human_sleep,
     join_telegram_target,
@@ -104,7 +105,6 @@ class AutomationWorker:
                 report.channels_subscribed += task_res.completed_count
                 report.subscribe_earned += task_res.earned_amount
                 if task_res.channels_limit_reached:
-                    # 500 ta kanal limitiga yetganda darhol Auto-Leave ishga tushiramiz
                     leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
                     await leave_worker.leave_due_for_account(client, account)
                     report.status = "channels_limit"
@@ -205,7 +205,7 @@ class AutomationWorker:
 
     async def _send_cmd_and_wait(
         self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 15.0
-    ) -> Optional[Message]:
+    ) -> Optional[Any]:
         try:
             async with client.conversation(bot_entity, timeout=timeout) as conv:
                 await conv.send_message(text)
@@ -216,7 +216,7 @@ class AutomationWorker:
 
     async def _step_start_and_mandatory_sub(
         self, client: TelegramClient, account: AccountModel, bot_entity: object
-    ) -> tuple[Optional[Message], int]:
+    ) -> tuple[Optional[Any], int]:
         """1-qadam: /start yuborish va majburiy obuna kanallariga qo'shilish."""
         reply = await self._send_cmd_and_wait(client, bot_entity, "/start")
         if not reply:
@@ -273,7 +273,7 @@ class AutomationWorker:
         client: TelegramClient,
         account: AccountModel,
         bot_entity: object,
-        last_msg: Optional[Message],
+        last_msg: Optional[Any],
     ) -> Decimal:
         """2-qadam: Kunlik Bonus (24 soatda 1 marta)."""
         now = datetime.now(timezone.utc)
@@ -282,14 +282,13 @@ class AutomationWorker:
             if elapsed < timedelta(hours=24):
                 return Decimal("0.00")
 
-        current_msg = last_msg
-        bonus_btn = find_reply_button_text(current_msg, ("bonus", "бонус"))
+        bonus_btn = find_reply_button_text(last_msg, ("bonus", "бонус"))
         if not bonus_btn:
-            earn_btn = find_reply_button_text(current_msg, ("pul ishlash", "заработ"))
+            earn_btn = await find_recent_reply_button(client, bot_entity, EARN_MENU_KEYWORDS)
             if earn_btn:
-                current_msg = await self._send_cmd_and_wait(client, bot_entity, earn_btn)
+                menu_msg = await self._send_cmd_and_wait(client, bot_entity, earn_btn)
                 await human_sleep(1.5, 3.0)
-                bonus_btn = find_reply_button_text(current_msg, ("bonus", "бонус"))
+                bonus_btn = find_reply_button_text(menu_msg, ("bonus", "бонус"))
 
         if not bonus_btn:
             bonus_btn = "Bonus"
