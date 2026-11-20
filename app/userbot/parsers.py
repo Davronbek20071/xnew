@@ -29,13 +29,16 @@ _MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{3,31})\b")
 # X Obunachi [Bot] popup/xabar balans formatlari:
 # "11.50 ₽ + 1 ₽ = 12.5 ₽" yoki "Sizga 1.4 ₽ bonus berildi"
 _ALERT_EQUATION_RE = re.compile(
-    r"([\d.,]+)\s*(?:₽|rub|руб|so['’`]?m|uzs)?\s*\+\s*([\d.,]+)\s*(?:₽|rub|руб|so['’`]?m|uzs)?\s*=\s*([\d.,]+)",
+    r"([\d.,]+)\s*(?:₽|rub|руб|so['’`ʻʼ]?m|uzs)?\s*\+\s*([\d.,]+)\s*(?:₽|rub|руб|so['’`ʻʼ]?m|uzs)?\s*=\s*([\d.,]+)",
     re.IGNORECASE,
 )
 _CURRENCY_AMOUNT_RE = re.compile(
-    r"([\d]+(?:[.,][\d]+)?)\s*(?:₽|rub|руб|so['’`]?m|uzs)",
+    r"([\d]+(?:[.,][\d]+)?)\s*(?:₽|rub|руб|so['’`ʻʼ]?m|uzs)",
     re.IGNORECASE,
 )
+
+# Barcha o'zbekcha tutuq/apostrof Unicode variantlari (U+02BB, U+02BC, U+2018, U+2019, va h.k.)
+_APOSTROPHE_RE = re.compile(r"[‘’ʻʼ`´′‛ʹˈ]")
 
 # "Kanallar tugadi" kalit so'zlari
 NO_MORE_CHANNELS_KEYWORDS = (
@@ -43,8 +46,6 @@ NO_MORE_CHANNELS_KEYWORDS = (
     "mavjud emas",
     "kanal yo'q",
     "kanallar yo'q",
-    "kanal yo‘q",
-    "kanallar yo‘q",
     "hozircha kanal",
     "boshqa kanal",
     "vazifalar tugadi",
@@ -57,9 +58,7 @@ NO_MORE_CHANNELS_KEYWORDS = (
 MANDATORY_SUB_KEYWORDS = (
     "majburiy",
     "obuna bo'ling",
-    "obuna bo‘ling",
     "a'zo bo'ling",
-    "a’zo bo‘ling",
     "azo bo'ling",
     "foydalanish uchun",
     "подпишитесь",
@@ -158,22 +157,22 @@ def parse_bonus_amount(text: str) -> Optional[Decimal]:
     return None
 
 
+def normalize_button_text(text: str) -> str:
+    """Tugma va xabar matnini taqqoslash uchun barcha apostroflarni yagona `'` ga keltiradi."""
+    cleaned = _APOSTROPHE_RE.sub("'", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def is_no_more_channels(text: str) -> bool:
-    low = (text or "").lower()
+    low = normalize_button_text(text)
     return any(kw in low for kw in NO_MORE_CHANNELS_KEYWORDS)
 
 
 def is_mandatory_sub_message(text: str, button_texts: List[str]) -> bool:
-    low = (text or "").lower()
+    low = normalize_button_text(text)
     has_kw = any(kw in low for kw in MANDATORY_SUB_KEYWORDS)
     has_confirm_btn = any(
-        any(k in (b or "").lower() for k in ("tasdiq", "tekshir", "провер", "confirm"))
+        any(k in normalize_button_text(b) for k in ("tasdiq", "tekshir", "провер", "confirm"))
         for b in button_texts
     )
     return has_kw and has_confirm_btn
-
-
-def normalize_button_text(text: str) -> str:
-    """Tugma matnini taqqoslash uchun emojilarsiz kichik harfga o'tkazadi."""
-    cleaned = (text or "").lower().replace("‘", "'").replace("’", "'").replace("`", "'")
-    return re.sub(r"\s+", " ", cleaned).strip()
