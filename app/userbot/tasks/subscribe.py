@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 from decimal import Decimal
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from loguru import logger
 from telethon import TelegramClient
@@ -16,20 +16,8 @@ from telethon.errors import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl.functions.account import UpdateNotifySettingsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import (
-    InputFolderPeer,
-    InputNotifyPeer,
-    InputPeerNotifySettings,
-    KeyboardButtonCallback,
-    KeyboardButtonUrl,
-    Message,
-    ReplyInlineMarkup,
-    ReplyKeyboardMarkup,
-)
 
 from app.db.models import AccountModel
 from app.userbot.parsers import (
@@ -48,61 +36,91 @@ async def human_sleep(min_sec: float, max_sec: float) -> None:
     await asyncio.sleep(delay)
 
 
-def extract_inline_urls(msg: Message) -> List[str]:
+def _markup_rows(msg: Any) -> list:
+    if not msg or not getattr(msg, "reply_markup", None):
+        return []
+    return list(getattr(msg.reply_markup, "rows", None) or [])
+
+
+def _is_inline_markup(msg: Any) -> bool:
+    markup = getattr(msg, "reply_markup", None) if msg else None
+    if markup is None:
+        return False
+    return type(markup).__name__ == "ReplyInlineMarkup"
+
+
+def _is_reply_keyboard(msg: Any) -> bool:
+    markup = getattr(msg, "reply_markup", None) if msg else None
+    if markup is None:
+        return False
+    return type(markup).__name__ == "ReplyKeyboardMarkup"
+
+
+def extract_inline_urls(msg: Any) -> List[str]:
     urls: List[str] = []
-    if not msg or not isinstance(msg.reply_markup, ReplyInlineMarkup):
+    if not _is_inline_markup(msg):
         return urls
-    for row in msg.reply_markup.rows:
-        for btn in row.buttons:
-            if isinstance(btn, KeyboardButtonUrl) and btn.url:
-                urls.append(btn.url)
+    for row in _markup_rows(msg):
+        for btn in getattr(row, "buttons", None) or []:
+            url = getattr(btn, "url", None)
+            if url:
+                urls.append(str(url))
     return urls
 
 
-def extract_button_texts(msg: Message) -> List[str]:
+def extract_button_texts(msg: Any) -> List[str]:
     texts: List[str] = []
-    if not msg or not msg.reply_markup:
-        return texts
-    if isinstance(msg.reply_markup, (ReplyInlineMarkup, ReplyKeyboardMarkup)):
-        for row in msg.reply_markup.rows:
-            for btn in row.buttons:
-                if getattr(btn, "text", None):
-                    texts.append(btn.text)
+    for row in _markup_rows(msg):
+        for btn in getattr(row, "buttons", None) or []:
+            text = getattr(btn, "text", None)
+            if text:
+                texts.append(str(text))
     return texts
 
 
 def find_inline_callback_coords(
-    msg: Message, keywords: Iterable[str]
+    msg: Any, keywords: Iterable[str]
 ) -> Optional[Tuple[int, int, str]]:
-    """Inline tugmalar ichidan mos kalit so'zli tugma koordinatasini (row, col) topadi."""
-    if not msg or not isinstance(msg.reply_markup, ReplyInlineMarkup):
+    """Inline tugmalar ichidan mos kalit so'zli callback tugma koordinatasini (row, col) topadi."""
+    if not _is_inline_markup(msg):
         return None
     kw_list = [normalize_button_text(k) for k in keywords]
-    for r_idx, row in enumerate(msg.reply_markup.rows):
-        for c_idx, btn in enumerate(row.buttons):
-            if isinstance(btn, KeyboardButtonCallback):
-                btn_norm = normalize_button_text(btn.text)
+    for r_idx, row in enumerate(_markup_rows(msg)):
+        for c_idx, btn in enumerate(getattr(row, "buttons", None) or []):
+            # Callback tugmalarda `data` atributi bo'ladi, URL tugmalarda esa `url`
+            if getattr(btn, "data", None) is not None and not getattr(btn, "url", None):
+                btn_text = str(getattr(btn, "text", "") or "")
+                btn_norm = normalize_button_text(btn_text)
                 if any(k in btn_norm for k in kw_list):
-                    return r_idx, c_idx, btn.text
+                    return r_idx, c_idx, btn_text
     return None
 
 
-def find_reply_button_text(msg: Message, keywords: Iterable[str]) -> Optional[str]:
+def find_reply_button_text(msg: Any, keywords: Iterable[str]) -> Optional[str]:
     """Reply klaviaturadan mos tugma matnini topadi."""
-    if not msg or not isinstance(msg.reply_markup, ReplyKeyboardMarkup):
+    if not _is_reply_keyboard(msg):
         return None
     kw_list = [normalize_button_text(k) for k in keywords]
-    for row in msg.reply_markup.rows:
-        for btn in row.buttons:
-            btn_norm = normalize_button_text(btn.text)
+    for row in _markup_rows(msg):
+        for btn in getattr(row, "buttons", None) or []:
+            btn_text = str(getattr(btn, "text", "") or "")
+            btn_norm = normalize_button_text(btn_text)
             if any(k in btn_norm for k in kw_list):
-                return btn.text
+                return btn_text
     return None
 
 
 async def mute_and_archive_peer(client: TelegramClient, entity: object) -> None:
     """Kanal bildirishnomalarini o'chiradi (mute) va Arxiv papkasiga o'tkazadi."""
     try:
+        from telethon.tl.functions.account import UpdateNotifySettingsRequest
+        from telethon.tl.functions.folders import EditPeerFoldersRequest
+        from telethon.tl.types import (
+            InputFolderPeer,
+            InputNotifyPeer,
+            InputPeerNotifySettings,
+        )
+
         input_peer = await client.get_input_entity(entity)
         await client(
             UpdateNotifySettingsRequest(
@@ -161,7 +179,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
 
     async def _send_and_wait_reply(
         self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 15.0
-    ) -> Optional[Message]:
+    ) -> Optional[Any]:
         try:
             async with client.conversation(bot_entity, timeout=timeout) as conv:
                 await conv.send_message(text)
@@ -275,7 +293,6 @@ class SubscribeTaskHandler(BaseTaskHandler):
                     action_type="error",
                     details=f"Yaroqsiz havola {target.raw}: {exc}",
                 )
-                # Agar "O'tkazib yuborish" tugmasi bo'lsa bosamiz, aks holda siklni to'xtatamiz
                 skip_coords = find_inline_callback_coords(
                     current_msg, ("o'tkazib", "otkazib", "keyingi", "пропустить", "skip")
                 )
@@ -358,7 +375,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
         bot_entity: object,
         prev_msg_id: int,
         prev_text: str,
-    ) -> Optional[Message]:
+    ) -> Optional[Any]:
         """Bot yuborgan yangi xabar yoki tahrirlangan xabarni oladi."""
         for _ in range(3):
             msgs = await client.get_messages(bot_entity, limit=2)
