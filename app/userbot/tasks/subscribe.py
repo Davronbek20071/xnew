@@ -29,6 +29,9 @@ from app.userbot.parsers import (
 )
 from app.userbot.tasks.base import BaseTaskHandler, TaskRunResult
 
+EARN_MENU_KEYWORDS = ("mablag", "yig'ish", "yigish", "pul ishlash", "заработ")
+SUBSCRIBE_BTN_KEYWORDS = ("obuna bo'lish", "obuna bolish", "kanalga obuna", "подписаться")
+
 
 async def human_sleep(min_sec: float, max_sec: float) -> None:
     """Inson harakatiga o'xshash tasodifiy pauza."""
@@ -87,7 +90,6 @@ def find_inline_callback_coords(
     kw_list = [normalize_button_text(k) for k in keywords]
     for r_idx, row in enumerate(_markup_rows(msg)):
         for c_idx, btn in enumerate(getattr(row, "buttons", None) or []):
-            # Callback tugmalarda `data` atributi bo'ladi, URL tugmalarda esa `url`
             if getattr(btn, "data", None) is not None and not getattr(btn, "url", None):
                 btn_text = str(getattr(btn, "text", "") or "")
                 btn_norm = normalize_button_text(btn_text)
@@ -97,7 +99,7 @@ def find_inline_callback_coords(
 
 
 def find_reply_button_text(msg: Any, keywords: Iterable[str]) -> Optional[str]:
-    """Reply klaviaturadan mos tugma matnini topadi."""
+    """Reply klaviaturadan mos tugma matnini (emojisi bilan aynan) topadi."""
     if not _is_reply_keyboard(msg):
         return None
     kw_list = [normalize_button_text(k) for k in keywords]
@@ -107,6 +109,22 @@ def find_reply_button_text(msg: Any, keywords: Iterable[str]) -> Optional[str]:
             btn_norm = normalize_button_text(btn_text)
             if any(k in btn_norm for k in kw_list):
                 return btn_text
+    return None
+
+
+async def find_recent_reply_button(
+    client: TelegramClient,
+    bot_entity: object,
+    keywords: Iterable[str],
+    limit: int = 8,
+) -> Optional[str]:
+    """Botning oxirgi xabarlaridagi eng so'nggi ReplyKeyboard ichidan kerakli tugmani topadi."""
+    msgs = await client.get_messages(bot_entity, limit=limit)
+    for m in msgs:
+        if _is_reply_keyboard(m):
+            found = find_reply_button_text(m, keywords)
+            if found:
+                return found
     return None
 
 
@@ -199,22 +217,37 @@ class SubscribeTaskHandler(BaseTaskHandler):
         delay_max = self.settings.action_delay_max_sec
         max_tasks = self.settings.max_tasks_per_cycle
 
-        # 1. Reply menyudan "Obuna bo'lish" bo'limiga kirish
-        latest_msgs = await client.get_messages(bot_entity, limit=2)
-        last_msg = latest_msgs[0] if latest_msgs else None
+        # 1. Avval joriy menyudan "Obuna bo'lish" ni qidiramiz; bo'lmasa "Mablag' yig'ish" ga kiramiz
+        sub_btn = await find_recent_reply_button(client, bot_entity, SUBSCRIBE_BTN_KEYWORDS)
+        menu_msg = None
 
-        sub_btn = find_reply_button_text(last_msg, ("obuna bo'lish", "obuna bolish", "подписаться"))
         if not sub_btn:
-            earn_btn = find_reply_button_text(last_msg, ("pul ishlash", "заработ"))
-            if earn_btn:
-                last_msg = await self._send_and_wait_reply(client, bot_entity, earn_btn)
-                await human_sleep(1.5, 3.0)
-                sub_btn = find_reply_button_text(
-                    last_msg, ("obuna bo'lish", "obuna bolish", "подписаться")
-                )
+            earn_btn = await find_recent_reply_button(client, bot_entity, EARN_MENU_KEYWORDS)
+            earn_text = earn_btn or "🧰 Mablag‘ yig‘ish"
+            logger.info("[{}] '{}' menyusiga kirilmoqda...", account.phone, earn_text)
+            menu_msg = await self._send_and_wait_reply(client, bot_entity, earn_text)
+            await human_sleep(1.5, 3.0)
+            if menu_msg:
+                sub_btn = find_reply_button_text(menu_msg, SUBSCRIBE_BTN_KEYWORDS)
 
-        target_text = sub_btn or "Obuna bo‘lish"
-        task_intro_msg = await self._send_and_wait_reply(client, bot_entity, target_text)
+        task_intro_msg = None
+        if sub_btn:
+            logger.info("[{}] '{}' tugmasi bosilmoqda...", account.phone, sub_btn)
+            task_intro_msg = await self._send_and_wait_reply(client, bot_entity, sub_btn)
+        elif menu_msg is not None:
+            # Agar "Mablag' yig'ish" ichida inline tugmalar chiqqan bo'lsa
+            inline_sub = find_inline_callback_coords(menu_msg, SUBSCRIBE_BTN_KEYWORDS)
+            if inline_sub:
+                logger.info("[{}] Inline '{}' bosilmoqda...", account.phone, inline_sub[2])
+                prev_text = menu_msg.raw_text or ""
+                await menu_msg.click(inline_sub[0], inline_sub[1])
+                await asyncio.sleep(2.5)
+                task_intro_msg = await self._fetch_next_task_message(
+                    client, bot_entity, menu_msg.id, prev_text
+                )
+            else:
+                task_intro_msg = menu_msg
+
         if not task_intro_msg:
             result.stopped_reason = "no_reply_to_subscribe_menu"
             return result
@@ -232,7 +265,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
             r_idx, c_idx, btn_label = here_coords
             logger.info("[{}] '{}' inline tugmasi bosilmoqda...", account.phone, btn_label)
             await human_sleep(1.5, 3.5)
-            prev_text = current_msg.raw_text
+            prev_text = current_msg.raw_text or ""
             await current_msg.click(r_idx, c_idx)
             await asyncio.sleep(2.5)
             current_msg = await self._fetch_next_task_message(
@@ -298,7 +331,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 )
                 if skip_coords:
                     await human_sleep(1.5, 3.0)
-                    prev_text = current_msg.raw_text
+                    prev_text = current_msg.raw_text or ""
                     await current_msg.click(skip_coords[0], skip_coords[1])
                     await asyncio.sleep(2.5)
                     current_msg = await self._fetch_next_task_message(
@@ -308,7 +341,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 result.stopped_reason = "invalid_channel_no_skip"
                 break
 
-            # Insoniy pauza (3-6s yoki sozlamadagi pauza)
+            # Insoniy pauza (3-8s yoki sozlamadagi pauza)
             await human_sleep(delay_min, delay_max)
 
             # "Obuna bo'ldim" inline tugmasini bosish
@@ -321,7 +354,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 result.stopped_reason = "no_confirm_button"
                 break
 
-            prev_text = current_msg.raw_text
+            prev_text = current_msg.raw_text or ""
             prev_id = current_msg.id
             callback_answer = await current_msg.click(confirm_coords[0], confirm_coords[1])
             alert_text = getattr(callback_answer, "message", "") or ""
@@ -381,7 +414,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
             msgs = await client.get_messages(bot_entity, limit=2)
             if msgs:
                 newest = msgs[0]
-                if newest.id != prev_msg_id or newest.raw_text != prev_text:
+                if newest.id != prev_msg_id or (newest.raw_text or "") != prev_text:
                     return newest
             await asyncio.sleep(1.5)
         msgs = await client.get_messages(bot_entity, limit=1)
