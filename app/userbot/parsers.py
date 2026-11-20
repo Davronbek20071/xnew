@@ -40,8 +40,9 @@ _CURRENCY_AMOUNT_RE = re.compile(
 # Barcha o'zbekcha tutuq/apostrof Unicode variantlari (U+02BB, U+02BC, U+2018, U+2019, va h.k.)
 _APOSTROPHE_RE = re.compile(r"[‘’ʻʼ`´′‛ʹˈ]")
 
-# "Kanallar tugadi" kalit so'zlari
+# "Kanallar tugadi / qolmadi" kalit so'zlari
 NO_MORE_CHANNELS_KEYWORDS = (
+    "qolmadi",
     "tugadi",
     "mavjud emas",
     "kanal yo'q",
@@ -49,6 +50,7 @@ NO_MORE_CHANNELS_KEYWORDS = (
     "hozircha kanal",
     "boshqa kanal",
     "vazifalar tugadi",
+    "keyinroq qayta urinib",
     "закончились",
     "нет доступных",
     "пока нет каналов",
@@ -129,7 +131,7 @@ def _to_decimal(num_str: str) -> Decimal:
 def parse_balance_alert(alert_text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     """Callback alert matnidan (earned_amount, new_balance) ni ajratadi.
 
-    Namuna: '11.50 ₽ + 1 ₽ = 12.5 ₽' -> (Decimal('1'), Decimal('12.5'))
+    Namuna: '✅ Obuna bo‘ldingiz! 💰 11.50 ₽ + 1 ₽ = 12.5 ₽' -> (Decimal('1'), Decimal('12.5'))
     """
     if not alert_text:
         return None, None
