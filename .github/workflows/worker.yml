@@ -1,0 +1,56 @@
+name: X Obunachi Userbot Worker
+
+on:
+  schedule:
+    # Har 25 daqiqada ishga tushadi (Private repo'da oylik 2000 daqiqa limitga
+    # sig'ish uchun kerak bo'lsa '*/35 * * * *' yoki '*/45 * * * *' qilishingiz mumkin)
+    - cron: '*/25 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Cooldown'ni kutmasdan barcha akkauntlarni majburiy ishlatish"
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: x-obunachi-worker
+  cancel-in-progress: false
+
+jobs:
+  run-userbot-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Kodni yuklab olish
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 ni sozlash
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Kutubxonalarni o'rnatish
+        run: pip install -r requirements.txt
+
+      - name: Userbot siklini ishga tushirish
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          DEFAULT_API_ID: ${{ secrets.DEFAULT_API_ID }}
+          DEFAULT_API_HASH: ${{ secrets.DEFAULT_API_HASH }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+          DEFAULT_TARGET_BOT: ${{ secrets.DEFAULT_TARGET_BOT }}
+          LOG_LEVEL: INFO
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python -m app.worker_once --force
+          else
+            python -m app.worker_once
+          fi

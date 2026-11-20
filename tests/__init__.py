@@ -1,0 +1,1 @@
+"""Avtomatlashtirilgan testlar to'plami."""

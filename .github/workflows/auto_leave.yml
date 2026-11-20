@@ -1,0 +1,40 @@
+name: X Obunachi Auto-Leave Worker (16 kunlik nazorat)
+
+on:
+  schedule:
+    # Har 6 soatda muddati 16 kun to'lgan kanallardan avtomatik chiqadi
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: x-obunachi-auto-leave
+  cancel-in-progress: false
+
+jobs:
+  run-auto-leave:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kodni yuklab olish
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 ni sozlash
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Kutubxonalarni o'rnatish
+        run: pip install -r requirements.txt
+
+      - name: Auto-Leave jarayonini ishga tushirish
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          DEFAULT_API_ID: ${{ secrets.DEFAULT_API_ID }}
+          DEFAULT_API_HASH: ${{ secrets.DEFAULT_API_HASH }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+          LOG_LEVEL: INFO
+        run: python -m app.auto_leave_once

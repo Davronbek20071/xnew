@@ -1,0 +1,15 @@
+[Unit]
+Description=X Obunachi Multi-Userbot Tizimi (24/7 Daemon)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/x_obunachi_userbot
+EnvironmentFile=/opt/x_obunachi_userbot/.env
+ExecStart=/opt/x_obunachi_userbot/.venv/bin/python -m app.run_daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

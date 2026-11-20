@@ -1,0 +1,9 @@
+services:
+  x-obunachi-userbot:
+    build: .
+    container_name: x-obunachi-userbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
