@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 
+import httpx
 from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -20,6 +21,50 @@ app = FastAPI(title="X Obunachi Admin Bot (Vercel Webhook)")
 @app.get("/api/health")
 async def healthcheck() -> dict:
     return {"status": "ok", "service": "x-obunachi-multi-userbot"}
+
+
+@app.get("/api/cron-trigger")
+async def cron_trigger(
+    secret: str = Query(..., description="WEBHOOK_SECRET qiymati"),
+    workflow: str = Query(default="worker.yml", description="Workflow fayl nomi"),
+    force: str = Query(default="false", description="Cooldown'ni chetlab o'tish: true/false"),
+):
+    """Tashqi tekin cron servisi (masalan, cron-job.org) orqali GitHub Actions'ni aniq vaqtda ishga tushiradi."""
+    try:
+        config = get_config()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    if secret != config.webhook_secret:
+        raise HTTPException(status_code=403, detail="Noto'g'ri secret kalit.")
+    if not config.github_token or not config.github_repo:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "GITHUB_TOKEN yoki GITHUB_REPO sozlanmagan."},
+        )
+
+    url = (
+        f"https://api.github.com/repos/{config.github_repo.strip('/')}"
+        f"/actions/workflows/{workflow}/dispatches"
+    )
+    headers = {
+        "Authorization": f"Bearer {config.github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body: dict = {"ref": "main"}
+    if workflow == "worker.yml":
+        body["inputs"] = {"force": "true" if force.lower() == "true" else "false"}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, headers=headers, json=body)
+
+    if resp.status_code == 204:
+        return {"ok": True, "triggered": workflow, "force": force}
+    return JSONResponse(
+        status_code=resp.status_code,
+        content={"ok": False, "error": resp.text[:300]},
+    )
 
 
 @app.get("/api/setup-webhook")
