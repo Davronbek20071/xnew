@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 from loguru import logger
@@ -271,11 +271,41 @@ class SupabaseRepository:
         rows = await self._request("GET", "subscriptions", params=params)
         return [SubscriptionModel.model_validate(r) for r in (rows or [])]
 
+    async def list_protected_chat_ids(self, account_id: int) -> Set[int]:
+        """Hali 16 kun to'lmagan (jarima xavfi bor) kanallarning chat_id to'plamini qaytaradi."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        rows = await self._request(
+            "GET",
+            "subscriptions",
+            params={
+                "select": "chat_id",
+                "account_id": f"eq.{account_id}",
+                "is_left": "eq.false",
+                "leave_after": f"gt.{now_iso}",
+            },
+        )
+        return {int(r["chat_id"]) for r in (rows or []) if r.get("chat_id") is not None}
+
     async def mark_subscription_left(self, sub_id: int) -> None:
         await self._request(
             "PATCH",
             "subscriptions",
             params={"id": f"eq.{sub_id}"},
+            json_body={
+                "is_left": True,
+                "left_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    async def mark_subscription_left_by_chat_id(self, account_id: int, chat_id: int) -> None:
+        await self._request(
+            "PATCH",
+            "subscriptions",
+            params={
+                "account_id": f"eq.{account_id}",
+                "chat_id": f"eq.{chat_id}",
+                "is_left": "eq.false",
+            },
             json_body={
                 "is_left": True,
                 "left_at": datetime.now(timezone.utc).isoformat(),
@@ -312,6 +342,25 @@ class SupabaseRepository:
             "details": (details or "")[:1000],
         }
         await self._request("POST", "stats_logs", json_body=payload)
+
+    async def get_last_daily_leave_scan(self, account_id: int) -> Optional[datetime]:
+        """Ushbu akkauntda kunlik 16-kunlik Auto-Leave tekshiruvi oxirgi marta qachon o'tganini qaytaradi."""
+        rows = await self._request(
+            "GET",
+            "stats_logs",
+            params={
+                "select": "created_at",
+                "account_id": f"eq.{account_id}",
+                "action_type": "eq.info",
+                "details": "like.daily_auto_leave_scan*",
+                "order": "created_at.desc",
+                "limit": 1,
+            },
+        )
+        if not rows or not rows[0].get("created_at"):
+            return None
+        raw_dt = str(rows[0]["created_at"]).replace("Z", "+00:00")
+        return datetime.fromisoformat(raw_dt)
 
     async def get_global_stats(self) -> GlobalStatsSummary:
         accounts = await self.list_accounts()
