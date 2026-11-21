@@ -2,18 +2,18 @@ name: X Obunachi Auto-Leave Worker (16 kunlik nazorat)
 
 on:
   schedule:
-    # Har 6 soatda muddati 16 kun to'lgan kanallardan avtomatik chiqadi
-    - cron: '0 */6 * * *'
+    - cron: '0 */12 * * *'
   workflow_dispatch:
 
+# worker.yml bilan bir xil guruh — ikkalasi hech qachon bir vaqtda ishlamaydi!
 concurrency:
-  group: x-obunachi-auto-leave
+  group: x-obunachi-shared-sessions
   cancel-in-progress: false
 
 jobs:
   run-auto-leave:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Kodni yuklab olish
         uses: actions/checkout@v4
