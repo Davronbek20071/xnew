@@ -10,6 +10,7 @@ from app.db.repository import SupabaseRepository
 from app.logger import setup_logger
 from app.security import SessionCipher
 from app.services.notifier import AdminNotifier
+from app.userbot.finance import FinanceAutomation
 from app.userbot.manager import AccountManager
 
 
@@ -25,6 +26,15 @@ async def main(force: bool = False) -> None:
 
     try:
         await manager.run_once_all(force=force)
+
+        # Agar @imkon7isbot da yakunlanmagan buyurtma sababli navbatda turgan buyurtma bo'lsa,
+        # har siklda spamsiz qayta tekshirib, avvalgi buyurtma tugashi bilan darhol buyurtma beradi!
+        finance = FinanceAutomation(
+            config=config, repo=repo, notifier=notifier, cipher=cipher
+        )
+        if await finance.has_pending_order():
+            logger.info("Navbatda turgan avto-buyurtma aniqlandi, qayta tekshirilmoqda...")
+            await finance.run_auto_order(is_retry=True)
     finally:
         await repo.close()
 
