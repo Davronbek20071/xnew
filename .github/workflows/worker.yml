@@ -2,8 +2,6 @@ name: X Obunachi Userbot Worker
 
 on:
   schedule:
-    # Har 25 daqiqada ishga tushadi (Private repo'da oylik 2000 daqiqa limitga
-    # sig'ish uchun kerak bo'lsa '*/35 * * * *' yoki '*/45 * * * *' qilishingiz mumkin)
     - cron: '*/25 * * * *'
   workflow_dispatch:
     inputs:
@@ -16,8 +14,10 @@ on:
           - 'true'
           - 'false'
 
+# worker.yml va auto_leave.yml bitta guruhda turishi SHART —
+# aks holda ikkalasi bir vaqtda har xil IP dan ulanib AuthKeyDuplicatedError beradi!
 concurrency:
-  group: x-obunachi-worker
+  group: x-obunachi-shared-sessions
   cancel-in-progress: false
 
 jobs:
