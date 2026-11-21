@@ -1,0 +1,41 @@
+name: X Obunachi Auto-Transfer (08:30 & 18:30 UZT)
+
+on:
+  schedule:
+    # 08:30 UZT = 03:30 UTC | 18:30 UZT = 13:30 UTC
+    - cron: '30 3,13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: x-obunachi-shared-sessions
+  cancel-in-progress: false
+
+jobs:
+  run-transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Kodni yuklab olish
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 ni sozlash
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Kutubxonalarni o'rnatish
+        run: pip install -r requirements.txt
+
+      - name: Barcha akkauntlardan asosiy hisobga pul o'tkazish
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          DEFAULT_API_ID: ${{ secrets.DEFAULT_API_ID }}
+          DEFAULT_API_HASH: ${{ secrets.DEFAULT_API_HASH }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+          DEFAULT_TARGET_BOT: ${{ secrets.DEFAULT_TARGET_BOT }}
+          LOG_LEVEL: INFO
+        run: python -m app.transfer_once
