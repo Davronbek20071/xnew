@@ -48,6 +48,7 @@ class CycleReport:
     bonus_earned: Decimal = Decimal("0.00")
     channels_subscribed: int = 0
     subscribe_earned: Decimal = Decimal("0.00")
+    channels_left: int = 0
     status: str = "ok"
     note: str = ""
 
@@ -79,7 +80,7 @@ class AutomationWorker:
         *,
         sleep_on_flood: bool = False,
     ) -> CycleReport:
-        """Bitta akkaunt uchun to'liq 3 qadamli siklni bajaradi."""
+        """Bitta akkaunt uchun to'liq 4 qadamli siklni bajaradi."""
         report = CycleReport(account_phone=account.phone)
         target_username = self.settings.target_bot_username.lstrip("@")
 
@@ -113,16 +114,21 @@ class AutomationWorker:
             await human_sleep(1.5, 3.5)
 
             # 3-QADAM: Kanallarga obuna bo'lish (va boshqa ulangan vazifa modullari)
+            channels_limit_hit = False
             for handler in self.task_handlers:
                 task_res = await handler.execute(client, account, bot_entity)
                 report.channels_subscribed += task_res.completed_count
                 report.subscribe_earned += task_res.earned_amount
                 if task_res.channels_limit_reached:
-                    leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
-                    await leave_worker.leave_due_for_account(client, account)
+                    channels_limit_hit = True
                     report.status = "channels_limit"
-                    report.note = "500 ta kanal limitiga yetdi; Auto-Leave tekshirildi."
+                    report.note = "500 ta kanal limitiga yetdi; to'liq Auto-Leave ishga tushirildi."
                     break
+
+            # 4-QADAM: Kunlik 16-kunlik Auto-Leave tekshiruvi (har 24 soatda 1 marta yoki 500 limitda)
+            report.channels_left = await self._step_daily_auto_leave(
+                client, account, force=channels_limit_hit
+            )
 
             # Keyingi sikl vaqtini tasodifiy (min..max daqiqa) belgilash
             next_minutes = random.uniform(
@@ -227,6 +233,32 @@ class AutomationWorker:
             report.status = "error"
             report.note = str(exc)
             return report
+
+    async def _step_daily_auto_leave(
+        self,
+        client: TelegramClient,
+        account: AccountModel,
+        *,
+        force: bool = False,
+    ) -> int:
+        """4-qadam: Har 24 soatda 1 marta akkauntdagi barcha 16+ kunlik kanal/guruhlarni tark etadi."""
+        if not force:
+            last_scan = await self.repo.get_last_daily_leave_scan(account.id)
+            if last_scan:
+                elapsed = datetime.now(timezone.utc) - last_scan.astimezone(timezone.utc)
+                if elapsed < timedelta(hours=24):
+                    return 0
+
+        logger.info(
+            "[{}] Kunlik 16-kunlik to'liq Auto-Leave tekshiruvi boshlanmoqda...",
+            account.phone,
+        )
+        leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
+        return await leave_worker.leave_due_for_account(
+            client,
+            account,
+            leave_days=self.settings.auto_leave_days,
+        )
 
     async def _send_cmd_and_wait(
         self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 15.0
