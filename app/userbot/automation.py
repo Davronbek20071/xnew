@@ -30,6 +30,7 @@ from app.userbot.tasks.base import BaseTaskHandler
 from app.userbot.tasks.subscribe import (
     EARN_MENU_KEYWORDS,
     SubscribeTaskHandler,
+    click_inline_button,
     extract_button_texts,
     extract_inline_urls,
     find_inline_callback_coords,
@@ -83,6 +84,18 @@ class AutomationWorker:
         target_username = self.settings.target_bot_username.lstrip("@")
 
         try:
+            # Agar avvalgi FloodWait muddati tugagan bo'lsa, holatni darhol ACTIVE ga qaytaramiz
+            if account.status == AccountStatus.FLOOD_WAIT:
+                await self.repo.update_account(
+                    account.id,
+                    {
+                        "status": AccountStatus.ACTIVE,
+                        "status_reason": None,
+                        "flood_until": None,
+                    },
+                )
+                account.status = AccountStatus.ACTIVE
+
             bot_entity = await client.get_entity(target_username)
 
             # 1-QADAM: /start va Majburiy obunani tekshirish
@@ -143,6 +156,7 @@ class AutomationWorker:
                     "status": AccountStatus.FLOOD_WAIT,
                     "status_reason": f"FloodWait {wait_sec}s",
                     "flood_until": flood_until,
+                    "last_active_at": datetime.now(timezone.utc),
                     "next_run_at": flood_until,
                 },
             )
@@ -194,10 +208,21 @@ class AutomationWorker:
 
         except Exception as exc:
             logger.exception("[{}] Kutilmagan xatolik: {}", account.phone, exc)
+            now = datetime.now(timezone.utc)
+            await self.repo.update_account(
+                account.id,
+                {
+                    "status": AccountStatus.ACTIVE,
+                    "status_reason": f"{type(exc).__name__}: {str(exc)[:180]}",
+                    "flood_until": None,
+                    "last_active_at": now,
+                    "next_run_at": now + timedelta(minutes=10),
+                },
+            )
             await self.repo.log_stat(
                 account_id=account.id,
                 action_type="error",
-                details=f"Kutilmagan xato: {exc}",
+                details=f"Kutilmagan xato: {type(exc).__name__}: {exc}",
             )
             report.status = "error"
             report.note = str(exc)
@@ -260,7 +285,7 @@ class AutomationWorker:
                 reply, ("tasdiq", "tekshir", "провер", "confirm")
             )
             if confirm:
-                await reply.click(confirm[0], confirm[1])
+                await click_inline_button(reply, confirm[0], confirm[1])
                 await asyncio.sleep(2.5)
                 msgs = await client.get_messages(bot_entity, limit=1)
                 if msgs:
