@@ -6,6 +6,13 @@ from datetime import datetime, timezone
 from typing import Dict, List
 
 from loguru import logger
+from telethon.errors import (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+)
 
 from app.config import AppConfig
 from app.db.models import AccountModel, AccountStatus
@@ -16,13 +23,20 @@ from app.userbot.auto_leave import AutoLeaveWorker
 from app.userbot.automation import AutomationWorker, CycleReport
 from app.userbot.client_factory import create_telegram_client
 
+DEAD_SESSION_ERRORS = (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+    SessionRevokedError,
+)
+
 
 class AccountManager:
     """Ko'p akkauntli sessiyalarni boshqaruvchi markaziy menejer.
 
-    Ikkala rejimda ishlaydi:
-    1. `run_once_all()` — GitHub Actions / Cron uchun bir siklli ishga tushirish.
-    2. `run_forever_daemon()` — VPS / Docker uchun 24/7 mustaqil asyncio.Task lar.
+    Har bir akkaunt to'liq izolyatsiya qilingan: bitta akkauntda sessiya uzilsa yoki
+    xato chiqsa ham, qolgan barcha akkauntlar to'xtamasdan oxirigacha ishlaydi.
     """
 
     def __init__(
@@ -38,6 +52,28 @@ class AccountManager:
         self.notifier = notifier
         self.cipher = cipher
         self._tasks: Dict[int, asyncio.Task] = {}
+
+    async def _mark_session_dead(self, account: AccountModel, reason: str) -> None:
+        logger.error("[{}] Sessiya yaroqsiz ({}): {}", account.phone, reason, account.id)
+        await self.repo.update_account(
+            account.id,
+            {
+                "status": AccountStatus.BANNED,
+                "status_reason": reason[:250],
+            },
+        )
+        await self.repo.log_stat(
+            account_id=account.id,
+            action_type="error",
+            details=f"Sessiya yaroqsiz: {reason}",
+        )
+        await self.notifier.notify(
+            f"❌ <b>Akkaunt sessiyasi uzildi!</b>\n"
+            f"📱 Akkaunt: <code>{account.phone}</code>\n"
+            f"📝 Sabab: <code>{reason[:200]}</code>\n"
+            f"👉 Ushbu akkauntni Admin Botdan o‘chirib qaytadan ulang. "
+            f"Qolgan akkauntlar ishlashda davom etmoqda."
+        )
 
     async def _run_single_account_once(
         self,
@@ -89,18 +125,8 @@ class AccountManager:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                logger.error("[{}] Sessiya avtorizatsiyadan chiqib ketgan!", account.phone)
-                await self.repo.update_account(
-                    account.id,
-                    {
-                        "status": AccountStatus.BANNED,
-                        "status_reason": "Sessiya avtorizatsiyadan chiqqan (not authorized)",
-                    },
-                )
-                await self.notifier.notify(
-                    f"❌ <b>Sessiya uzildi!</b>\n"
-                    f"📱 Akkaunt: <code>{account.phone}</code>\n"
-                    f"Qaytadan Admin Panel orqali ulang."
+                await self._mark_session_dead(
+                    account, "Sessiya avtorizatsiyadan chiqqan (not authorized)"
                 )
                 return CycleReport(account_phone=account.phone, status="unauthorized")
 
@@ -108,6 +134,17 @@ class AccountManager:
                 repo=self.repo, notifier=self.notifier, settings=settings
             )
             return await worker.run_cycle(client, account, sleep_on_flood=sleep_on_flood)
+        except DEAD_SESSION_ERRORS as exc:
+            await self._mark_session_dead(account, f"{type(exc).__name__}: {exc}")
+            return CycleReport(account_phone=account.phone, status="banned", note=str(exc))
+        except Exception as exc:
+            logger.exception("[{}] Ulanish/ishlashda xatolik: {}", account.phone, exc)
+            await self.repo.log_stat(
+                account_id=account.id,
+                action_type="error",
+                details=f"Manager xatosi: {type(exc).__name__}: {exc}",
+            )
+            return CycleReport(account_phone=account.phone, status="error", note=str(exc))
         finally:
             try:
                 await client.disconnect()
@@ -127,22 +164,31 @@ class AccountManager:
             async with sem:
                 return await self._run_single_account_once(acc, force=force, sleep_on_flood=False)
 
-        results = await asyncio.gather(*(_guarded(a) for a in accounts), return_exceptions=False)
-        for rep in results:
+        raw_results = await asyncio.gather(
+            *(_guarded(a) for a in accounts), return_exceptions=True
+        )
+        reports: List[CycleReport] = []
+        for acc, res in zip(accounts, raw_results):
+            if isinstance(res, Exception):
+                logger.exception("[{}] Kutilmagan gather xatosi: {}", acc.phone, res)
+                reports.append(CycleReport(account_phone=acc.phone, status="error", note=str(res)))
+                continue
+            reports.append(res)
             logger.info(
                 "Yakun [{}]: status={} | majburiy={} | bonus={} | obuna={} (+{} ₽)",
-                rep.account_phone,
-                rep.status,
-                rep.mandatory_joined,
-                rep.bonus_earned,
-                rep.channels_subscribed,
-                rep.subscribe_earned,
+                res.account_phone,
+                res.status,
+                res.mandatory_joined,
+                res.bonus_earned,
+                res.channels_subscribed,
+                res.subscribe_earned,
             )
-        return list(results)
+        return reports
 
     async def run_auto_leave_all(self) -> int:
         """Barcha faol akkauntlar uchun 16 kunlik muddati tugagan kanallardan chiqadi."""
         accounts = await self.repo.list_active_accounts()
+        settings = await self.repo.get_settings(default_target_bot=self.config.default_target_bot)
         total_left = 0
         leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
 
@@ -158,7 +204,11 @@ class AccountManager:
             try:
                 await client.connect()
                 if await client.is_user_authorized():
-                    total_left += await leave_worker.leave_due_for_account(client, acc)
+                    total_left += await leave_worker.leave_due_for_account(
+                        client, acc, leave_days=settings.auto_leave_days
+                    )
+            except DEAD_SESSION_ERRORS as exc:
+                await self._mark_session_dead(acc, f"Auto-Leave {type(exc).__name__}: {exc}")
             except Exception as exc:
                 logger.warning("[{}] Auto-Leave ulanish xatosi: {}", acc.phone, exc)
             finally:
@@ -171,7 +221,6 @@ class AccountManager:
 
     async def _daemon_account_loop(self, account_id: int) -> None:
         """VPS 24/7 rejimi: bitta akkaunt uchun uzluksiz mustaqil sikl."""
-        # Boshlang'ich tasodifiy kechikish
         await asyncio.sleep(random.uniform(2.0, 20.0))
         while True:
             acc = await self.repo.get_account(account_id)
@@ -201,7 +250,6 @@ class AccountManager:
                 active_accounts = await self.repo.list_active_accounts()
                 active_ids = {a.id for a in active_accounts}
 
-                # Yangi faollashgan akkauntlar uchun task yaratish
                 for acc in active_accounts:
                     task = self._tasks.get(acc.id)
                     if task is None or task.done():
@@ -209,14 +257,12 @@ class AccountManager:
                             self._daemon_account_loop(acc.id), name=f"acc-{acc.id}"
                         )
 
-                # To'xtatilgan akkauntlar taskini bekor qilish
                 for aid in list(self._tasks.keys()):
                     if aid not in active_ids:
                         t = self._tasks.pop(aid)
                         if not t.done():
                             t.cancel()
 
-                # Har 1 soatda Auto-Leave tekshiruvi
                 now = datetime.now(timezone.utc)
                 if (now - last_leave_check).total_seconds() >= 3600:
                     await self.run_auto_leave_all()
