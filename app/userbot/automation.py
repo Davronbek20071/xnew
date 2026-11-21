@@ -54,7 +54,12 @@ class CycleReport:
 
 
 class AutomationWorker:
-    """Har bir akkaunt uchun X Obunachi [Bot] avtomatlashtirish algoritmi."""
+    """Har bir akkaunt uchun X Obunachi [Bot] avtomatlashtirish algoritmi.
+
+    Faqat tezkor 3-qadamli obuna/bonus siklini bajaradi (16 kunlik to'liq Auto-Leave
+    alohida `auto_leave.yml` workflow'da ishlaydi, shuning uchun obuna sikli hech qachon
+    sekinlashmaydi va timeout bo'lmaydi).
+    """
 
     def __init__(
         self,
@@ -80,7 +85,7 @@ class AutomationWorker:
         *,
         sleep_on_flood: bool = False,
     ) -> CycleReport:
-        """Bitta akkaunt uchun to'liq 4 qadamli siklni bajaradi."""
+        """Bitta akkaunt uchun to'liq 3 qadamli siklni bajaradi."""
         report = CycleReport(account_phone=account.phone)
         target_username = self.settings.target_bot_username.lstrip("@")
 
@@ -105,30 +110,32 @@ class AutomationWorker:
             )
             report.mandatory_joined = mandatory_count
 
-            await human_sleep(1.5, 3.5)
+            await human_sleep(1.5, 3.0)
 
             # 2-QADAM: Kunlik Bonus (24 soatda 1 marta)
             bonus_val = await self._step_daily_bonus(client, account, bot_entity, start_reply)
             report.bonus_earned = bonus_val
 
-            await human_sleep(1.5, 3.5)
+            await human_sleep(1.5, 3.0)
 
             # 3-QADAM: Kanallarga obuna bo'lish (va boshqa ulangan vazifa modullari)
-            channels_limit_hit = False
             for handler in self.task_handlers:
                 task_res = await handler.execute(client, account, bot_entity)
                 report.channels_subscribed += task_res.completed_count
                 report.subscribe_earned += task_res.earned_amount
                 if task_res.channels_limit_reached:
-                    channels_limit_hit = True
+                    # 500 ta limitga yetgandagina tezkor baza bo'yicha tozalashni ishga tushiramiz
+                    leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
+                    report.channels_left = await leave_worker.leave_due_for_account(
+                        client,
+                        account,
+                        leave_days=self.settings.auto_leave_days,
+                        max_per_run=15,
+                        scan_dialogs=False,
+                    )
                     report.status = "channels_limit"
-                    report.note = "500 ta kanal limitiga yetdi; to'liq Auto-Leave ishga tushirildi."
+                    report.note = "500 ta kanal limitiga yetdi; tezkor Auto-Leave bajarildi."
                     break
-
-            # 4-QADAM: Kunlik 16-kunlik Auto-Leave tekshiruvi (har 24 soatda 1 marta yoki 500 limitda)
-            report.channels_left = await self._step_daily_auto_leave(
-                client, account, force=channels_limit_hit
-            )
 
             # Keyingi sikl vaqtini tasodifiy (min..max daqiqa) belgilash
             next_minutes = random.uniform(
@@ -234,41 +241,19 @@ class AutomationWorker:
             report.note = str(exc)
             return report
 
-    async def _step_daily_auto_leave(
-        self,
-        client: TelegramClient,
-        account: AccountModel,
-        *,
-        force: bool = False,
-    ) -> int:
-        """4-qadam: Har 24 soatda 1 marta akkauntdagi barcha 16+ kunlik kanal/guruhlarni tark etadi."""
-        if not force:
-            last_scan = await self.repo.get_last_daily_leave_scan(account.id)
-            if last_scan:
-                elapsed = datetime.now(timezone.utc) - last_scan.astimezone(timezone.utc)
-                if elapsed < timedelta(hours=24):
-                    return 0
-
-        logger.info(
-            "[{}] Kunlik 16-kunlik to'liq Auto-Leave tekshiruvi boshlanmoqda...",
-            account.phone,
-        )
-        leave_worker = AutoLeaveWorker(repo=self.repo, notifier=self.notifier)
-        return await leave_worker.leave_due_for_account(
-            client,
-            account,
-            leave_days=self.settings.auto_leave_days,
-        )
-
     async def _send_cmd_and_wait(
-        self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 15.0
+        self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 25.0
     ) -> Optional[Any]:
         try:
             async with client.conversation(bot_entity, timeout=timeout) as conv:
                 await conv.send_message(text)
                 return await conv.get_response()
         except asyncio.TimeoutError:
-            logger.warning("Bot '{}' buyrug'iga javob bermadi.", text)
+            logger.warning("Bot '{}' buyrug'iga kechikdi, oxirgi xabar tekshirilmoqda...", text)
+            msgs = await client.get_messages(bot_entity, limit=2)
+            for m in msgs:
+                if not getattr(m, "out", False):
+                    return m
             return None
 
     async def _step_start_and_mandatory_sub(
