@@ -1,0 +1,41 @@
+name: X Obunachi Auto-Order (09:00 & 19:00 UZT)
+
+on:
+  schedule:
+    # 09:00 UZT = 04:00 UTC | 19:00 UZT = 14:00 UTC
+    - cron: '0 4,14 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: x-obunachi-shared-sessions
+  cancel-in-progress: false
+
+jobs:
+  run-order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kodni yuklab olish
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 ni sozlash
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Kutubxonalarni o'rnatish
+        run: pip install -r requirements.txt
+
+      - name: Asosiy akkauntda avto-buyurtma berish
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          DEFAULT_API_ID: ${{ secrets.DEFAULT_API_ID }}
+          DEFAULT_API_HASH: ${{ secrets.DEFAULT_API_HASH }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+          DEFAULT_TARGET_BOT: ${{ secrets.DEFAULT_TARGET_BOT }}
+          LOG_LEVEL: INFO
+        run: python -m app.order_once
