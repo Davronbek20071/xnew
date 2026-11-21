@@ -8,11 +8,18 @@ from typing import Any, Iterable, List, Optional, Tuple
 from loguru import logger
 from telethon import TelegramClient
 from telethon.errors import (
+    AuthKeyUnregisteredError,
+    BotResponseTimeoutError,
     ChannelPrivateError,
     ChannelsTooMuchError,
+    FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    InviteRequestSentError,
+    SessionRevokedError,
     UserAlreadyParticipantError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
@@ -39,6 +46,14 @@ CONFIRM_SUB_KEYWORDS = (
     "tekshir",
     "подписался",
     "проверить",
+)
+
+CRITICAL_ACCOUNT_ERRORS = (
+    FloodWaitError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+    SessionRevokedError,
 )
 
 
@@ -129,12 +144,16 @@ def find_inline_callback_coords(
 
 async def click_inline_button(msg: Any, r_idx: int, c_idx: int) -> Any:
     """Telethon MessageButton.click() yoki msg.click(r, c) orqali ishonchli bosadi."""
-    buttons_2d = getattr(msg, "buttons", None)
-    if buttons_2d and r_idx < len(buttons_2d) and c_idx < len(buttons_2d[r_idx]):
-        btn = buttons_2d[r_idx][c_idx]
-        if hasattr(btn, "click"):
-            return await btn.click()
-    return await msg.click(r_idx, c_idx)
+    try:
+        buttons_2d = getattr(msg, "buttons", None)
+        if buttons_2d and r_idx < len(buttons_2d) and c_idx < len(buttons_2d[r_idx]):
+            btn = buttons_2d[r_idx][c_idx]
+            if hasattr(btn, "click"):
+                return await btn.click()
+        return await msg.click(r_idx, c_idx)
+    except (BotResponseTimeoutError, asyncio.TimeoutError):
+        logger.warning("Inline tugma callback javobi kechikdi (BotResponseTimeoutError).")
+        return None
 
 
 def find_reply_button_text(msg: Any, keywords: Iterable[str]) -> Optional[str]:
@@ -212,12 +231,19 @@ async def join_telegram_target(
                 entity = chats[0]
         except UserAlreadyParticipantError:
             already_joined = True
+        except InviteRequestSentError:
+            # Yopiq kanalda admin tasdig'i (Join Request) yoqilgan — so'rov yuborildi
+            logger.info("Yopiq kanalga qo'shilish so'rovi (Join Request) yuborildi: {}", target.raw)
+            return None, target.raw, False
     else:
         entity = await client.get_entity(target.value)
         try:
             await client(JoinChannelRequest(entity))
         except UserAlreadyParticipantError:
             already_joined = True
+        except InviteRequestSentError:
+            logger.info("Kanalga qo'shilish so'rovi yuborildi: {}", target.raw)
+            return getattr(entity, "id", None), getattr(entity, "title", None), False
 
     if entity is not None:
         await mute_and_archive_peer(client, entity)
@@ -252,10 +278,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
         here_coords: Tuple[int, int, str],
         account_phone: str,
     ) -> Tuple[Optional[Any], str]:
-        """'Shu yerda obuna' tugmasini bosadi.
-
-        Qaytaradi: (yangi_topshiriq_xabari_yoki_None, callback_alert_matni)
-        """
+        """'Shu yerda obuna' tugmasini bosadi."""
         r_idx, c_idx, btn_label = here_coords
         latest_before = await client.get_messages(bot_entity, limit=1)
         last_id_before = latest_before[0].id if latest_before else intro_msg.id
@@ -339,7 +362,6 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 result.stopped_reason = "no_more_channels"
                 return result
         else:
-            # Agar bot to'g'ridan-to'g'ri kanal kartochkasini yuborgan bo'lsa
             if find_inline_callback_coords(task_intro_msg, CONFIRM_SUB_KEYWORDS):
                 current_msg = task_intro_msg
             else:
@@ -385,6 +407,8 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 chat_id, title, already = await join_telegram_target(client, target)
                 if already:
                     logger.info("[{}] Akkaunt allaqachon a'zo: {}", account.phone, target.raw)
+            except CRITICAL_ACCOUNT_ERRORS:
+                raise
             except ChannelsTooMuchError:
                 logger.warning("[{}] 500 ta kanal limitiga yetildi!", account.phone)
                 result.channels_limit_reached = True
@@ -406,12 +430,20 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 UsernameInvalidError,
                 UsernameNotOccupiedError,
                 ChannelPrivateError,
+                ValueError,
+                Exception,
             ) as exc:
-                logger.warning("[{}] Yaroqsiz kanal havolasi ({}): {}", account.phone, target.raw, exc)
+                logger.warning(
+                    "[{}] Kanalga qo'shilishda xato ({}): {} - {}",
+                    account.phone,
+                    target.raw,
+                    type(exc).__name__,
+                    exc,
+                )
                 await self.repo.log_stat(
                     account_id=account.id,
                     action_type="error",
-                    details=f"Yaroqsiz havola {target.raw}: {exc}",
+                    details=f"Kanal xatosi {target.raw}: {type(exc).__name__}: {exc}",
                 )
                 skip_coords = find_inline_callback_coords(
                     current_msg, ("o'tkazib", "otkazib", "keyingi", "пропустить", "skip")
@@ -423,7 +455,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
                         client, bot_entity, min_msg_id=current_msg.id, max_wait_sec=8.0
                     )
                     continue
-                result.stopped_reason = "invalid_channel_no_skip"
+                result.stopped_reason = f"channel_join_error:{type(exc).__name__}"
                 break
 
             # Insoniy pauza (sozlamadagi min..max soniya)
@@ -513,7 +545,6 @@ class SubscribeTaskHandler(BaseTaskHandler):
             for m in msgs:
                 if m.id <= min_msg_id:
                     continue
-                # O'zimiz yuborgan xabarlarni o'tkazib yuboramiz
                 if getattr(m, "out", False):
                     continue
                 if find_inline_callback_coords(m, CONFIRM_SUB_KEYWORDS) or is_no_more_channels(
