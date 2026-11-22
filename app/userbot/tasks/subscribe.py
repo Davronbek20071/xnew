@@ -175,13 +175,15 @@ async def find_recent_reply_button(
     keywords: Iterable[str],
     limit: int = 8,
 ) -> Optional[str]:
-    """Botning oxirgi xabarlaridagi eng so'nggi ReplyKeyboard ichidan kerakli tugmani topadi."""
+    """FAQAT eng so'nggi faol ReplyKeyboard ichidan kerakli tugmani qidiradi.
+
+    MUHIM: Avvalgi sikllardagi eski klaviaturalarga qarab adashmasligi uchun
+    birinchi uchragan faol ReplyKeyboard tekshiriladi va darhol natija qaytariladi!
+    """
     msgs = await client.get_messages(bot_entity, limit=limit)
     for m in msgs:
         if _is_reply_keyboard(m):
-            found = find_reply_button_text(m, keywords)
-            if found:
-                return found
+            return find_reply_button_text(m, keywords)
     return None
 
 
@@ -232,7 +234,6 @@ async def join_telegram_target(
         except UserAlreadyParticipantError:
             already_joined = True
         except InviteRequestSentError:
-            # Yopiq kanalda admin tasdig'i (Join Request) yoqilgan — so'rov yuborildi
             logger.info("Yopiq kanalga qo'shilish so'rovi (Join Request) yuborildi: {}", target.raw)
             return None, target.raw, False
     else:
@@ -260,7 +261,7 @@ class SubscribeTaskHandler(BaseTaskHandler):
     name = "subscribe"
 
     async def _send_and_wait_reply(
-        self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 15.0
+        self, client: TelegramClient, bot_entity: object, text: str, timeout: float = 25.0
     ) -> Optional[Any]:
         try:
             async with client.conversation(bot_entity, timeout=timeout) as conv:
@@ -268,6 +269,10 @@ class SubscribeTaskHandler(BaseTaskHandler):
                 return await conv.get_response()
         except asyncio.TimeoutError:
             logger.warning("Bot javob bermadi (timeout): {}", text)
+            msgs = await client.get_messages(bot_entity, limit=2)
+            for m in msgs:
+                if not getattr(m, "out", False):
+                    return m
             return None
 
     async def _click_here_and_get_task(
@@ -307,18 +312,32 @@ class SubscribeTaskHandler(BaseTaskHandler):
         delay_max = self.settings.action_delay_max_sec
         max_tasks = self.settings.max_tasks_per_cycle
 
-        # 1. "Mablag' yig'ish" -> "Obuna bo'lish" menyusiga kirish
+        # 1. Joriy faol menyuda "Obuna bo'lish" borligini tekshiramiz;
+        # bo'lmasa "Mablag' yig'ish" ga kiramiz (agar bot "Assalomu alaykum" qaytarsa, 1 marta qayta urinamiz!)
         sub_btn = await find_recent_reply_button(client, bot_entity, SUBSCRIBE_BTN_KEYWORDS)
         menu_msg = None
 
         if not sub_btn:
-            earn_btn = await find_recent_reply_button(client, bot_entity, EARN_MENU_KEYWORDS)
-            earn_text = earn_btn or "Mablag‘ yig‘ish"
-            logger.info("[{}] '{}' menyusiga kirilmoqda...", account.phone, earn_text)
-            menu_msg = await self._send_and_wait_reply(client, bot_entity, earn_text)
-            await human_sleep(1.5, 3.0)
-            if menu_msg:
-                sub_btn = find_reply_button_text(menu_msg, SUBSCRIBE_BTN_KEYWORDS)
+            for attempt in range(2):
+                earn_btn = await find_recent_reply_button(client, bot_entity, EARN_MENU_KEYWORDS)
+                earn_text = earn_btn or "Mablag‘ yig‘ish"
+                logger.info(
+                    "[{}] '{}' menyusiga kirilmoqda (urinish {})...",
+                    account.phone,
+                    earn_text,
+                    attempt + 1,
+                )
+                menu_msg = await self._send_and_wait_reply(client, bot_entity, earn_text)
+                await human_sleep(1.5, 3.0)
+                if menu_msg:
+                    sub_btn = find_reply_button_text(menu_msg, SUBSCRIBE_BTN_KEYWORDS)
+                    if sub_btn:
+                        break
+                    # Agar bot yana bosh menyu ("Assalomu alaykum") qaytargan bo'lsa, 2-urinish qilamiz
+                    logger.info(
+                        "[{}] 'Mablag' yig'ish' dan ichki menyu kelmadi, qayta urinilmoqda...",
+                        account.phone,
+                    )
 
         task_intro_msg = None
         if sub_btn:
