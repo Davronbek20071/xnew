@@ -454,26 +454,33 @@ class FinanceAutomation:
 
         await human_sleep(1.5, 2.5)
         await click_inline_button(preview_msg, confirm_coords[0], confirm_coords[1])
-        await asyncio.sleep(3.5)
 
-        recent = await client.get_messages(bot_entity, limit=4)
-        for m in recent:
-            if getattr(m, "out", False):
-                continue
-            txt = m.raw_text or ""
-            if is_unfinished_order_error(txt):
-                return _SingleOrderAttempt(status="busy", balance=balance, min_qty=min_qty)
-            norm = normalize_button_text(txt)
-            if "qabul qilindi" in norm or "buyurtma raqami" in norm:
-                order_id = parse_order_id(txt) or "—"
-                remaining = max(Decimal("0.00"), balance - Decimal(order_qty))
-                return _SingleOrderAttempt(
-                    status="accepted",
-                    ordered_qty=order_qty,
-                    order_id=order_id,
-                    balance=remaining,
-                    min_qty=min_qty,
-                )
+        # Bot "Tekshirilmoqda!" dan keyin adminlikni tekshirib 4-10 soniyada xabarni tahrirlaydi;
+        # 15 soniyagacha har 1.5 soniyada tekshirib turamiz.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15.0
+        while loop.time() < deadline:
+            await asyncio.sleep(1.5)
+            recent = await client.get_messages(bot_entity, limit=5)
+            for m in recent:
+                if getattr(m, "out", False):
+                    continue
+                if m.id < preview_msg.id:
+                    continue
+                txt = m.raw_text or ""
+                if is_unfinished_order_error(txt):
+                    return _SingleOrderAttempt(status="busy", balance=balance, min_qty=min_qty)
+                norm = normalize_button_text(txt)
+                if "qabul qilindi" in norm or "buyurtma raqami" in norm:
+                    order_id = parse_order_id(txt) or "—"
+                    remaining = max(Decimal("0.00"), balance - Decimal(order_qty))
+                    return _SingleOrderAttempt(
+                        status="accepted",
+                        ordered_qty=order_qty,
+                        order_id=order_id,
+                        balance=remaining,
+                        min_qty=min_qty,
+                    )
 
         return _SingleOrderAttempt(
             status="error",
