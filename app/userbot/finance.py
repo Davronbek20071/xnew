@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, List, Optional, Tuple
 
@@ -34,6 +35,7 @@ from app.userbot.tasks.subscribe import (
 DEFAULT_MASTER_PHONE = "+8801890592783"
 DEFAULT_MASTER_BOT_ID = "399380"
 DEFAULT_ORDER_CHANNEL = "@imkon7isbot"
+DEFAULT_BACKUP_ORDER_CHANNEL = "@MemoraUzApp"
 PENDING_ORDER_SETTING_KEY = "pending_auto_order"
 
 DEAD_SESSION_ERRORS = (
@@ -51,6 +53,16 @@ _MAX_ORDER_RE = re.compile(r"eng\s*ko[‘’ʻʼ'`´]?p\s*buyurtma\s*miqdori\s*:
 _ORDER_ID_RE = re.compile(r"buyurtma\s*raqami\s*:\s*(\d+)", re.IGNORECASE)
 
 
+@dataclass
+class _SingleOrderAttempt:
+    status: str  # "accepted" | "busy" | "low_balance" | "error"
+    ordered_qty: int = 0
+    order_id: str = "—"
+    balance: Optional[Decimal] = None
+    min_qty: int = 10
+    note: str = ""
+
+
 def _digits_only(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
 
@@ -61,6 +73,18 @@ def _format_amount(val: Decimal) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s or "0"
+
+
+def _normalize_channel_ref(raw: str) -> str:
+    val = (raw or "").strip()
+    if not val:
+        return ""
+    m = re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})/?$", val, re.I)
+    if m:
+        return f"@{m.group(1)}"
+    if not val.startswith("@") and "t.me/" not in val:
+        return f"@{val}"
+    return val
 
 
 def parse_hisobim_info(text: str) -> Tuple[Optional[Decimal], Optional[str]]:
@@ -150,10 +174,11 @@ async def _wait_bot_reply_after(
 
 
 class FinanceAutomation:
-    """1) Barcha akkauntlardan asosiy akkauntga pul o'tkazish (08:30 & 18:30 UZT)
-    2) Asosiy akkauntda barcha balansga avto-buyurtma berish (09:00 & 19:00 UZT)
-    3) Agar kanalda yakunlanmagan buyurtma bo'lsa, navbatga qo'yib keyingi siklda
-       avtomatik qayta urinish (spamsiz!)
+    """1) Barcha akkauntlardan asosiy akkauntga pul o'tkazish (08:37 & 18:37 UZT)
+    2) Asosiy akkauntda avto-buyurtma berish (09:07 & 19:07 UZT):
+       - Avval @imkon7isbot kanaliga buyurtma beradi;
+       - Agar @imkon7isbot band bo'lsa, darhol zaxira @MemoraUzApp kanaliga beradi;
+       - Agar ikkalasi ham band bo'lsa, navbatga qo'yib har 15-20 daqiqada qayta tekshiradi.
     """
 
     def __init__(
@@ -180,21 +205,28 @@ class FinanceAutomation:
     async def _set_pending_order(self, value: bool) -> None:
         await self.repo.set_setting(PENDING_ORDER_SETTING_KEY, "true" if value else "false")
 
-    async def _get_finance_params(self) -> Tuple[str, str, str, str]:
-        """(target_bot, master_phone, master_bot_id, order_channel) ni oladi."""
+    async def _get_finance_params(self) -> Tuple[str, str, str, List[str]]:
+        """(target_bot, master_phone, master_bot_id, [primary_channel, backup_channel]) ni oladi."""
         raw = await self._get_raw_settings()
         target_bot = (
             raw.get("target_bot_username") or self.config.default_target_bot
         ).strip().lstrip("@")
         master_phone = (raw.get("master_phone") or DEFAULT_MASTER_PHONE).strip()
         master_bot_id = (raw.get("master_bot_id") or DEFAULT_MASTER_BOT_ID).strip()
-        order_channel = (raw.get("order_channel") or DEFAULT_ORDER_CHANNEL).strip()
-        if not order_channel.startswith("@") and "t.me/" not in order_channel:
-            order_channel = f"@{order_channel}"
-        return target_bot, master_phone, master_bot_id, order_channel
+
+        primary = _normalize_channel_ref(raw.get("order_channel") or DEFAULT_ORDER_CHANNEL)
+        backup = _normalize_channel_ref(
+            raw.get("backup_order_channel") or DEFAULT_BACKUP_ORDER_CHANNEL
+        )
+
+        channels: List[str] = []
+        for ch in (primary, backup):
+            if ch and ch.lower() not in {c.lower() for c in channels}:
+                channels.append(ch)
+        return target_bot, master_phone, master_bot_id, channels
 
     # ========================================================================
-    # 1-VAZIFA: BARCHA AKKAUNTLARDAN ASOSIY HISOBGA PUL O'TKAZISH (08:30, 18:30)
+    # 1-VAZIFA: BARCHA AKKAUNTLARDAN ASOSIY HISOBGA PUL O'TKAZISH
     # ========================================================================
     async def run_transfer_all(self) -> Decimal:
         target_bot, master_phone, master_bot_id, _ = await self._get_finance_params()
@@ -341,10 +373,116 @@ class FinanceAutomation:
         return Decimal("0.00")
 
     # ========================================================================
-    # 2-VAZIFA: ASOSIY AKKAUNTDA AVTO-BUYURTMA BERISH (09:00, 19:00 + AUTO-RETRY)
+    # 2-VAZIFA: ASOSIY AKKAUNTDA AVTO-BUYURTMA (@imkon7isbot -> @MemoraUzApp)
     # ========================================================================
+    async def _attempt_order_for_channel(
+        self,
+        client: TelegramClient,
+        bot_entity: object,
+        master_acc: AccountModel,
+        channel_ref: str,
+    ) -> _SingleOrderAttempt:
+        """Bitta aniq kanalga buyurtma berishga urinadi."""
+        # 1. /start
+        await _send_and_wait(client, bot_entity, "/start")
+        await human_sleep(1.5, 2.5)
+
+        # 2. "Buyurtma" reply tugmasi
+        order_btn = await find_recent_reply_button(client, bot_entity, ("buyurtma", "заказ"))
+        order_menu = await _send_and_wait(client, bot_entity, order_btn or "Buyurtma")
+        if not order_menu:
+            return _SingleOrderAttempt(status="error", note="'Buyurtma' menyusi ochilmadi.")
+
+        # 3. "Obunachi = 1 ₽" inline tugmasini bosish ("Tezkor obunachi" EMAS!)
+        sub_coords = find_regular_subscriber_button(order_menu)
+        if not sub_coords:
+            return _SingleOrderAttempt(status="error", note="'Obunachi = 1 ₽' tugmasi topilmadi.")
+
+        await human_sleep(1.5, 2.5)
+        await click_inline_button(order_menu, sub_coords[0], sub_coords[1])
+        qty_prompt = await _wait_bot_reply_after(client, bot_entity, min_msg_id=order_menu.id)
+        if not qty_prompt:
+            return _SingleOrderAttempt(status="error", note="Miqdor so'rovi kelmadi.")
+
+        balance, min_qty, max_qty = parse_order_limits(qty_prompt.raw_text or "")
+        if balance is None:
+            return _SingleOrderAttempt(status="error", note="Balans o'qilmadi.")
+
+        if int(balance) < min_qty:
+            return _SingleOrderAttempt(
+                status="low_balance",
+                balance=balance,
+                min_qty=min_qty,
+                note=f"Balans ({_format_amount(balance)} ₽) minimal {min_qty} ₽ dan kam.",
+            )
+
+        order_qty = min(int(balance), max_qty) if max_qty else int(balance)
+        logger.info(
+            "[{}] Buyurtma urinishi: {} dona (balans: {}, max: {}) -> {}",
+            master_acc.phone,
+            order_qty,
+            balance,
+            max_qty,
+            channel_ref,
+        )
+
+        # 4. Obunachi sonini yuborish
+        await human_sleep(1.5, 2.5)
+        link_prompt = await _send_and_wait(client, bot_entity, str(order_qty))
+        if not link_prompt:
+            return _SingleOrderAttempt(status="error", balance=balance, note="Kanal havolasi so'rovi kelmadi.")
+
+        # 5. Kanal username'ini yuborish
+        await human_sleep(1.5, 2.5)
+        preview_msg = await _send_and_wait(client, bot_entity, channel_ref)
+        if not preview_msg:
+            return _SingleOrderAttempt(status="error", balance=balance, note="Tasdiqlash oynasi kelmadi.")
+
+        if is_unfinished_order_error(preview_msg.raw_text or ""):
+            return _SingleOrderAttempt(status="busy", balance=balance, min_qty=min_qty)
+
+        # 6. "Tasdiqlash" inline tugmasini bosish
+        confirm_coords = find_inline_callback_coords(
+            preview_msg, ("tasdiqlash", "tasdiq", "подтвер")
+        )
+        if not confirm_coords:
+            return _SingleOrderAttempt(
+                status="error",
+                balance=balance,
+                note=f"Tasdiqlash tugmasi topilmadi: {(preview_msg.raw_text or '')[:140]}",
+            )
+
+        await human_sleep(1.5, 2.5)
+        await click_inline_button(preview_msg, confirm_coords[0], confirm_coords[1])
+        await asyncio.sleep(3.5)
+
+        recent = await client.get_messages(bot_entity, limit=4)
+        for m in recent:
+            if getattr(m, "out", False):
+                continue
+            txt = m.raw_text or ""
+            if is_unfinished_order_error(txt):
+                return _SingleOrderAttempt(status="busy", balance=balance, min_qty=min_qty)
+            norm = normalize_button_text(txt)
+            if "qabul qilindi" in norm or "buyurtma raqami" in norm:
+                order_id = parse_order_id(txt) or "—"
+                remaining = max(Decimal("0.00"), balance - Decimal(order_qty))
+                return _SingleOrderAttempt(
+                    status="accepted",
+                    ordered_qty=order_qty,
+                    order_id=order_id,
+                    balance=remaining,
+                    min_qty=min_qty,
+                )
+
+        return _SingleOrderAttempt(
+            status="error",
+            balance=balance,
+            note=f"{channel_ref} uchun buyurtma tasdiqlanmadi (@XObunachiBot kanalda adminligini tekshiring).",
+        )
+
     async def run_auto_order(self, *, is_retry: bool = False) -> int:
-        target_bot, master_phone, _, order_channel = await self._get_finance_params()
+        target_bot, master_phone, _, channels = await self._get_finance_params()
         master_digits = _digits_only(master_phone)
         accounts = await self.repo.list_accounts()
 
@@ -368,11 +506,10 @@ class FinanceAutomation:
             proxy=proxy,
         )
 
-        ordered_qty = 0
-        order_id = "—"
-        last_balance: Optional[Decimal] = None
-        unfinished_order_detected = False
-        stop_note = ""
+        chosen_channel = ""
+        is_backup_used = False
+        busy_channels: List[str] = []
+        final_attempt: Optional[_SingleOrderAttempt] = None
 
         try:
             await client.connect()
@@ -385,174 +522,106 @@ class FinanceAutomation:
 
             bot_entity = await client.get_entity(target_bot)
 
-            # 1. /start
-            await _send_and_wait(client, bot_entity, "/start")
-            await human_sleep(1.5, 2.5)
+            for idx, ch in enumerate(channels):
+                attempt = await self._attempt_order_for_channel(client, bot_entity, master_acc, ch)
+                final_attempt = attempt
 
-            # 2. "Buyurtma" reply tugmasi
-            order_btn = await find_recent_reply_button(client, bot_entity, ("buyurtma", "заказ"))
-            order_menu = await _send_and_wait(client, bot_entity, order_btn or "Buyurtma")
-            if not order_menu:
-                stop_note = "'Buyurtma' menyusi ochilmadi."
-            else:
-                # 3. "Obunachi = 1 ₽" inline tugmasini bosish ("Tezkor obunachi" EMAS!)
-                sub_coords = find_regular_subscriber_button(order_menu)
-                if not sub_coords:
-                    stop_note = "'Obunachi = 1 ₽' tugmasi topilmadi."
-                else:
-                    await human_sleep(1.5, 2.5)
-                    await click_inline_button(order_menu, sub_coords[0], sub_coords[1])
-                    qty_prompt = await _wait_bot_reply_after(
-                        client, bot_entity, min_msg_id=order_menu.id
+                if attempt.status == "accepted":
+                    chosen_channel = ch
+                    is_backup_used = idx > 0
+                    await self.repo.update_account(master_acc.id, {"balance": attempt.balance})
+                    await self.repo.log_stat(
+                        account_id=master_acc.id,
+                        action_type="info",
+                        amount=Decimal(attempt.ordered_qty),
+                        details=f"auto_order: #{attempt.order_id} | {attempt.ordered_qty} ta -> {ch}",
                     )
-                    if not qty_prompt:
-                        stop_note = "Miqdor so'rovi kelmadi."
-                    else:
-                        balance, min_qty, max_qty = parse_order_limits(qty_prompt.raw_text or "")
-                        last_balance = balance
-                        if balance is None:
-                            stop_note = "Balans o'qilmadi."
-                        elif int(balance) < min_qty:
-                            await self._set_pending_order(False)
-                            stop_note = (
-                                f"Balans ({_format_amount(balance)} ₽) minimal {min_qty} ₽ dan kam."
-                            )
-                        else:
-                            order_qty = min(int(balance), max_qty) if max_qty else int(balance)
-                            logger.info(
-                                "[{}] Buyurtma berilmoqda: {} dona (balans: {}, max: {}) -> {}",
-                                master_acc.phone,
-                                order_qty,
-                                balance,
-                                max_qty,
-                                order_channel,
-                            )
+                    # Qolgan balans hali ham >= min_qty bo'lsa, navbatda qoldiramiz
+                    rem_int = int(attempt.balance) if attempt.balance is not None else 0
+                    await self._set_pending_order(rem_int >= attempt.min_qty)
+                    break
 
-                            # 4. Obunachi sonini yuborish
-                            await human_sleep(1.5, 2.5)
-                            link_prompt = await _send_and_wait(client, bot_entity, str(order_qty))
-                            if not link_prompt:
-                                stop_note = "Kanal havolasi so'rovi kelmadi."
-                            else:
-                                # 5. Kanal username'ini yuborish (@imkon7isbot)
-                                await human_sleep(1.5, 2.5)
-                                preview_msg = await _send_and_wait(client, bot_entity, order_channel)
-                                if not preview_msg:
-                                    stop_note = "Buyurtma tasdiqlash oynasi kelmadi."
-                                elif is_unfinished_order_error(preview_msg.raw_text or ""):
-                                    unfinished_order_detected = True
-                                else:
-                                    # 6. "Tasdiqlash" inline tugmasini bosish
-                                    confirm_coords = find_inline_callback_coords(
-                                        preview_msg, ("tasdiqlash", "tasdiq", "подтвер")
-                                    )
-                                    if not confirm_coords:
-                                        stop_note = (
-                                            f"Tasdiqlash tugmasi topilmadi: "
-                                            f"{(preview_msg.raw_text or '')[:140]}"
-                                        )
-                                    else:
-                                        await human_sleep(1.5, 2.5)
-                                        await click_inline_button(
-                                            preview_msg, confirm_coords[0], confirm_coords[1]
-                                        )
-                                        await asyncio.sleep(3.5)
+                if attempt.status == "busy":
+                    busy_channels.append(ch)
+                    logger.info(
+                        "[{}] {} kanalida yakunlanmagan buyurtma bor — keyingi zaxira kanal tekshiriladi...",
+                        master_acc.phone,
+                        ch,
+                    )
+                    await human_sleep(2.0, 3.0)
+                    continue
 
-                                        recent = await client.get_messages(bot_entity, limit=4)
-                                        accepted_text = ""
-                                        for m in recent:
-                                            if getattr(m, "out", False):
-                                                continue
-                                            txt = m.raw_text or ""
-                                            if is_unfinished_order_error(txt):
-                                                unfinished_order_detected = True
-                                                break
-                                            norm = normalize_button_text(txt)
-                                            if "qabul qilindi" in norm or "buyurtma raqami" in norm:
-                                                accepted_text = txt
-                                                break
+                if attempt.status == "low_balance":
+                    await self._set_pending_order(False)
+                    break
 
-                                        if accepted_text and not unfinished_order_detected:
-                                            ordered_qty = order_qty
-                                            order_id = parse_order_id(accepted_text) or "—"
-                                            remaining = max(
-                                                Decimal("0.00"), balance - Decimal(order_qty)
-                                            )
-                                            last_balance = remaining
-                                            await self.repo.update_account(
-                                                master_acc.id, {"balance": remaining}
-                                            )
-                                            await self.repo.log_stat(
-                                                account_id=master_acc.id,
-                                                action_type="info",
-                                                amount=Decimal(order_qty),
-                                                details=(
-                                                    f"auto_order: #{order_id} | "
-                                                    f"{order_qty} ta -> {order_channel}"
-                                                ),
-                                            )
-                                            # Agar qolgan balans hali ham >= min_qty bo'lsa,
-                                            # ushbu buyurtma tugagach qolganini ham avtomatik buyurtma qiladi
-                                            await self._set_pending_order(int(remaining) >= min_qty)
-                                        elif not unfinished_order_detected:
-                                            stop_note = (
-                                                "Buyurtma qabul qilinganligi tasdiqlanmadi "
-                                                "(bot kanalda admin ekanini tekshiring)."
-                                            )
+                # Boshqa xato (masalan, bot admin emas) — keyingi zaxira kanal bo'lsa sinab ko'ramiz
+                logger.warning("[{}] {} uchun buyurtma xatosi: {}", master_acc.phone, ch, attempt.note)
+                if idx + 1 < len(channels):
+                    await human_sleep(2.0, 3.0)
+                    continue
+                break
 
         except Exception as exc:
             logger.exception("[{}] Avto-Buyurtmada xato: {}", master_acc.phone, exc)
-            stop_note = f"{type(exc).__name__}: {exc}"
+            final_attempt = _SingleOrderAttempt(status="error", note=f"{type(exc).__name__}: {exc}")
         finally:
             try:
                 await client.disconnect()
             except Exception:
                 pass
 
-        # --- Adminga aqlli (spamsiz) xabar yuborish ---
-        if ordered_qty > 0:
+        # --- Adminga aniq va spamsiz hisobot ---
+        if final_attempt and final_attempt.status == "accepted":
             bal_line = (
-                f"💰 Qolgan balans: <b>{_format_amount(last_balance)} ₽</b>"
-                if last_balance is not None
+                f"💰 Qolgan balans: <b>{_format_amount(final_attempt.balance)} ₽</b>"
+                if final_attempt.balance is not None
+                else ""
+            )
+            backup_tag = (
+                f" <i>(zaxira — {busy_channels[0]} band edi)</i>"
+                if is_backup_used and busy_channels
                 else ""
             )
             extra = (
                 "\n⏳ Qolgan balans ham avvalgi buyurtma tugashi bilan avtomatik buyurtma qilinadi."
-                if last_balance is not None and int(last_balance) >= 10
+                if final_attempt.balance is not None and int(final_attempt.balance) >= final_attempt.min_qty
                 else ""
             )
             await self.notifier.notify(
                 f"🛒 <b>Avto-Buyurtma muvaffaqiyatli berildi!</b>\n"
                 f"📱 Akkaunt: <code>{master_acc.phone}</code>\n"
-                f"📢 Kanal: <code>{order_channel}</code>\n"
-                f"👥 Obunachi soni: <b>{ordered_qty} ta ({ordered_qty} ₽)</b>\n"
-                f"🆔 Buyurtma raqami: <b>#{order_id}</b>\n"
+                f"📢 Kanal: <code>{chosen_channel}</code>{backup_tag}\n"
+                f"👥 Obunachi soni: <b>{final_attempt.ordered_qty} ta ({final_attempt.ordered_qty} ₽)</b>\n"
+                f"🆔 Buyurtma raqami: <b>#{final_attempt.order_id}</b>\n"
                 f"{bal_line}{extra}"
             )
-        elif unfinished_order_detected:
+            return final_attempt.ordered_qty
+
+        if len(busy_channels) == len(channels) and busy_channels:
             await self._set_pending_order(True)
-            logger.info(
-                "[{}] {} da yakunlanmagan buyurtma bor — keyingi siklda avtomatik qayta uriniladi.",
-                master_acc.phone,
-                order_channel,
-            )
-            # Faqat birinchi marta (09:00 / 19:00) adminga xabar beramiz, qayta urinishlarda spam qilmaymiz!
             if not is_retry:
-                bal_str = f"{_format_amount(last_balance)} ₽" if last_balance is not None else "—"
+                bal_str = (
+                    f"{_format_amount(final_attempt.balance)} ₽"
+                    if final_attempt and final_attempt.balance is not None
+                    else "—"
+                )
+                ch_list = " va ".join(f"<code>{c}</code>" for c in busy_channels)
                 await self.notifier.notify(
                     f"⏳ <b>Avto-Buyurtma navbatga qo‘yildi!</b>\n"
-                    f"📢 Kanal: <code>{order_channel}</code>\n"
+                    f"📢 Kanallar: {ch_list}\n"
                     f"💰 Hisobdagi mablag‘: <b>{bal_str}</b>\n"
-                    f"📝 Sabab: Kanalda avvalgi buyurtma hali yakunlanmagan.\n"
-                    f"🔄 Tizim har 15–20 daqiqada tekshirib, avvalgi buyurtma tugashi bilanoq "
+                    f"📝 Sabab: Ikkala kanalda ham faol (yakunlanmagan) buyurtma mavjud.\n"
+                    f"🔄 Tizim har 15–20 daqiqada tekshirib, qaysi biri birinchi bo‘shasa "
                     f"avtomatik buyurtma beradi!"
                 )
-        elif not is_retry:
+            return 0
+
+        if not is_retry:
+            note = final_attempt.note if final_attempt else "Balans yetarli emas."
             await self.notifier.notify(
                 f"ℹ️ <b>Avto-Buyurtma berilmadi</b>\n"
                 f"📱 Akkaunt: <code>{master_acc.phone}</code>\n"
-                f"📢 Kanal: <code>{order_channel}</code>\n"
-                f"📝 Sabab: {stop_note or 'Balans yetarli emas.'}"
+                f"📝 Sabab: {note}"
             )
-
-        return ordered_qty
+        return 0
