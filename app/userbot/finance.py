@@ -37,6 +37,7 @@ DEFAULT_MASTER_BOT_ID = "399380"
 DEFAULT_ORDER_CHANNEL = "@imkon7isbot"
 DEFAULT_BACKUP_ORDER_CHANNEL = "@MemoraUzApp"
 PENDING_ORDER_SETTING_KEY = "pending_auto_order"
+LAST_ORDER_CHANNEL_SETTING_KEY = "last_ordered_channel"
 
 DEAD_SESSION_ERRORS = (
     AuthKeyDuplicatedError,
@@ -204,6 +205,13 @@ class FinanceAutomation:
 
     async def _set_pending_order(self, value: bool) -> None:
         await self.repo.set_setting(PENDING_ORDER_SETTING_KEY, "true" if value else "false")
+
+    async def _get_last_ordered_channel(self) -> str:
+        raw = await self._get_raw_settings()
+        return _normalize_channel_ref(raw.get(LAST_ORDER_CHANNEL_SETTING_KEY, ""))
+
+    async def _set_last_ordered_channel(self, channel: str) -> None:
+        await self.repo.set_setting(LAST_ORDER_CHANNEL_SETTING_KEY, _normalize_channel_ref(channel))
 
     async def _get_finance_params(self) -> Tuple[str, str, str, List[str]]:
         """(target_bot, master_phone, master_bot_id, [primary_channel, backup_channel]) ni oladi."""
@@ -513,6 +521,17 @@ class FinanceAutomation:
             proxy=proxy,
         )
 
+        last_ordered_ch = await self._get_last_ordered_channel()
+        primary_ch = channels[0] if channels else ""
+        backup_blocked = (
+            len(channels) > 1
+            and bool(last_ordered_ch)
+            and last_ordered_ch.lower() == channels[1].lower()
+        )
+        # Agar oxirgi buyurtma zaxira kanalga (@MemoraUzApp) berilgan bo'lsa,
+        # bu safar FAQAT asosiy kanal (@imkon7isbot) ga ruxsat beramiz!
+        allowed_channels = [primary_ch] if backup_blocked else list(channels)
+
         chosen_channel = ""
         is_backup_used = False
         busy_channels: List[str] = []
@@ -529,7 +548,7 @@ class FinanceAutomation:
 
             bot_entity = await client.get_entity(target_bot)
 
-            for idx, ch in enumerate(channels):
+            for idx, ch in enumerate(allowed_channels):
                 attempt = await self._attempt_order_for_channel(client, bot_entity, master_acc, ch)
                 final_attempt = attempt
 
@@ -537,6 +556,7 @@ class FinanceAutomation:
                     chosen_channel = ch
                     is_backup_used = idx > 0
                     await self.repo.update_account(master_acc.id, {"balance": attempt.balance})
+                    await self._set_last_ordered_channel(ch)
                     await self.repo.log_stat(
                         account_id=master_acc.id,
                         action_type="info",
@@ -550,21 +570,29 @@ class FinanceAutomation:
 
                 if attempt.status == "busy":
                     busy_channels.append(ch)
+                    if idx + 1 < len(allowed_channels):
+                        logger.info(
+                            "[{}] {} band — zaxira kanal ({}) tekshiriladi...",
+                            master_acc.phone,
+                            ch,
+                            allowed_channels[idx + 1],
+                        )
+                        await human_sleep(2.0, 3.0)
+                        continue
                     logger.info(
-                        "[{}] {} kanalida yakunlanmagan buyurtma bor — keyingi zaxira kanal tekshiriladi...",
+                        "[{}] {} band (zaxira bloklangan={}) — navbatga qo'yiladi.",
                         master_acc.phone,
                         ch,
+                        backup_blocked,
                     )
-                    await human_sleep(2.0, 3.0)
-                    continue
+                    break
 
                 if attempt.status == "low_balance":
                     await self._set_pending_order(False)
                     break
 
-                # Boshqa xato (masalan, bot admin emas) — keyingi zaxira kanal bo'lsa sinab ko'ramiz
                 logger.warning("[{}] {} uchun buyurtma xatosi: {}", master_acc.phone, ch, attempt.note)
-                if idx + 1 < len(channels):
+                if idx + 1 < len(allowed_channels):
                     await human_sleep(2.0, 3.0)
                     continue
                 break
@@ -605,7 +633,7 @@ class FinanceAutomation:
             )
             return final_attempt.ordered_qty
 
-        if len(busy_channels) == len(channels) and busy_channels:
+        if len(busy_channels) == len(allowed_channels) and busy_channels:
             await self._set_pending_order(True)
             if not is_retry:
                 bal_str = (
@@ -613,14 +641,20 @@ class FinanceAutomation:
                     if final_attempt and final_attempt.balance is not None
                     else "—"
                 )
-                ch_list = " va ".join(f"<code>{c}</code>" for c in busy_channels)
+                if backup_blocked:
+                    reason_text = (
+                        f"<code>{primary_ch}</code> hali band. Oxirgi buyurtma zaxira "
+                        f"<code>{channels[1]}</code> kanaliga berilgani uchun unga ketma-ket "
+                        f"2-marta buyurtma berilmadi — faqat <code>{primary_ch}</code> bo‘shashi kutiladi."
+                    )
+                else:
+                    ch_list = " va ".join(f"<code>{c}</code>" for c in busy_channels)
+                    reason_text = f"{ch_list} kanallarida faol (yakunlanmagan) buyurtma mavjud."
                 await self.notifier.notify(
                     f"⏳ <b>Avto-Buyurtma navbatga qo‘yildi!</b>\n"
-                    f"📢 Kanallar: {ch_list}\n"
                     f"💰 Hisobdagi mablag‘: <b>{bal_str}</b>\n"
-                    f"📝 Sabab: Ikkala kanalda ham faol (yakunlanmagan) buyurtma mavjud.\n"
-                    f"🔄 Tizim har 15–20 daqiqada tekshirib, qaysi biri birinchi bo‘shasa "
-                    f"avtomatik buyurtma beradi!"
+                    f"📝 Sabab: {reason_text}\n"
+                    f"🔄 Tizim har 15–20 daqiqada tekshirib, bo‘shashi bilanoq avtomatik buyurtma beradi!"
                 )
             return 0
 
